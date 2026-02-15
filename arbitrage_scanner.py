@@ -1,8 +1,8 @@
 """
-OddsJam-Style Arbitrage Betting Tool
-Scans HardRock Bet (via The Odds API) and Kalshi for profitable arbitrage opportunities.
-Author: Professional Trading Systems Developer
-Version: 3.0
+Sportsbook-vs-Sportsbook Arbitrage Scanner
+Uses The Odds API to fetch odds from multiple books (DraftKings, FanDuel, HardRock, BetMGM, Kalshi)
+and finds arbitrage opportunities between them (best odds per side across books).
+Version: 4.0
 """
 
 import os
@@ -33,11 +33,14 @@ ODDS_API_URL = "https://api.the-odds-api.com/v4"
 
 # HardRock Bet is in region "us2" per The Odds API
 ODDS_REGIONS_FOR_HARDROCK = "us2"
+# Multi-book scan: top books + regions (us, us2, us_ex for Kalshi exchange)
+ODDS_BOOKMAKERS = ["draftkings", "fanduel", "hardrockbet", "betmgm", "kalshi"]
+ODDS_REGIONS_MULTI = "us,us2,us_ex"
 
 # Trading Parameters
 BANKROLL = 1000.00
-MIN_PROFIT_PCT = 0.01
-MAX_STAKE_PER_ARB = 100.00
+MIN_PROFIT_PCT = 1.0  # Minimum 1% profit to report an arb (profit_pct is in percent, e.g. 1.0 = 1%)
+MAX_STAKE_PER_ARB = 1000.00
 KELLY_FRACTION = 0.1  # Conservative Kelly sizing
 
 # Fee Structure
@@ -47,6 +50,10 @@ HARDROCK_MARGIN = 0.0    # Vig already in odds
 # Rate Limiting
 ODDS_API_DELAY = 1.0
 KALSHI_API_DELAY = 0.5
+
+# Continuous scan: seconds between full multi-sport scans (0 = start next cycle as soon as current one finishes).
+# Odds API allows 30 req/sec; we make 1 request per sport with ODDS_API_DELAY between them, so we stay under limit.
+SCAN_INTERVAL_SEC = 15
 
 # Matching Parameters
 FUZZY_MATCH_THRESHOLD = 60
@@ -75,6 +82,16 @@ class Sport(Enum):
     NCAAB = "basketball_ncaab"
     NHL = "icehockey_nhl"
     MLB = "baseball_mlb"
+
+
+# Sports to scan in one run (one Odds API request per sport)
+SPORTS_TO_SCAN: List[Sport] = [
+    Sport.NFL,
+    Sport.NBA,
+    Sport.NCAAB,
+    Sport.NHL,
+    Sport.MLB,
+]
 
 
 @dataclass
@@ -107,6 +124,79 @@ class ArbitrageOpportunity:
     profit_percentage: float
     match_confidence: int
 
+    timestamp: str = datetime.now().isoformat()
+
+
+@dataclass
+class BookVsBookOpportunity:
+    """Sportsbook-vs-sportsbook arbitrage (no Kalshi API)."""
+    game_id: str
+    sport: str
+    home_team: str
+    away_team: str
+    commence_time: str
+    # Side 1 (e.g. home)
+    side1_team: str
+    side1_book: str
+    side1_odds: float
+    side1_stake: float
+    side1_payout: float
+    # Side 2 (e.g. away)
+    side2_team: str
+    side2_book: str
+    side2_odds: float
+    side2_stake: float
+    side2_payout: float
+    total_investment: float
+    guaranteed_profit: float
+    profit_pct: float
+    timestamp: str = datetime.now().isoformat()
+
+
+@dataclass
+class TotalsOpportunity:
+    """Over/Under (totals) arbitrage between sportsbooks."""
+    game_id: str
+    sport: str
+    home_team: str
+    away_team: str
+    commence_time: str
+    point: float  # e.g. 234.5
+    over_book: str
+    over_odds: float
+    over_stake: float
+    over_payout: float
+    under_book: str
+    under_odds: float
+    under_stake: float
+    under_payout: float
+    total_investment: float
+    guaranteed_profit: float
+    profit_pct: float
+    timestamp: str = datetime.now().isoformat()
+
+
+@dataclass
+class SpreadsOpportunity:
+    """Point spread (handicap) arbitrage between sportsbooks."""
+    game_id: str
+    sport: str
+    home_team: str
+    away_team: str
+    commence_time: str
+    home_point: float   # e.g. -3.5
+    away_point: float   # e.g. +3.5
+    home_book: str
+    home_odds: float
+    home_stake: float
+    home_payout: float
+    away_book: str
+    away_odds: float
+    away_stake: float
+    away_payout: float
+    total_investment: float
+    guaranteed_profit: float
+    profit_pct: float
     timestamp: str = datetime.now().isoformat()
 
 
@@ -177,6 +267,38 @@ def jaccard_string_similarity(a: str, b: str) -> float:
     return jaccard_similarity(tokenize_to_set(a), tokenize_to_set(b))
 
 
+def align_outcomes_to_home_away(
+    home_team: str,
+    away_team: str,
+    outcomes: List[Dict],
+) -> Optional[Tuple[float, float]]:
+    """
+    Map a book's h2h outcomes to (home_odds, away_odds) using canonical game names.
+    outcomes = [{"name": "Team A", "price": -110}, {"name": "Team B", "price": 100}]
+    Returns (home_odds, away_odds) or None if alignment fails.
+    """
+    if not outcomes or len(outcomes) != 2:
+        return None
+    candidates = [home_team, away_team]
+    matched: Dict[str, float] = {}  # "home" or "away" -> american odds
+    for out in outcomes:
+        name = out.get("name", "")
+        price = out.get("price")
+        if price is None:
+            return None
+        result = fuzzy_match_teams(name, candidates, threshold=50)
+        if not result:
+            return None
+        which_team, _ = result
+        if which_team == home_team:
+            matched["home"] = float(price)
+        else:
+            matched["away"] = float(price)
+    if "home" in matched and "away" in matched:
+        return (matched["home"], matched["away"])
+    return None
+
+
 def fuzzy_match_teams(
     team_name: str,
     candidates: List[str],
@@ -226,13 +348,14 @@ class OddsAPIClient:
         sport: Sport,
         bookmakers: Optional[List[str]] = None,
         regions: Optional[str] = None,
+        markets: str = "h2h",
     ) -> List[Dict]:
-        """Fetch odds for a sport. Use regions=us2 for HardRock Bet."""
+        """Fetch odds for a sport. markets: 'h2h', 'totals', or 'h2h,totals' (each market costs quota)."""
         url = f"{self.base_url}/sports/{sport.value}/odds"
         params = {
             "apiKey": self.api_key,
             "regions": regions or ODDS_REGIONS_FOR_HARDROCK,
-            "markets": "h2h",
+            "markets": markets,
             "oddsFormat": "american",
         }
 
@@ -253,14 +376,37 @@ class OddsAPIClient:
             return []
 
     def get_remaining_requests(self) -> Optional[int]:
-        """Check remaining API requests"""
+        """Check remaining API requests (legacy). Prefer get_usage() for full picture."""
+        usage = self.get_usage()
+        return usage.get("remaining") if usage else None
+
+    def get_usage(self) -> Optional[Dict[str, int]]:
+        """
+        Get Odds API usage for current period (e.g. month).
+        GET /sports does not count against quota. Returns dict with:
+        - remaining: requests left this period
+        - used: requests used this period
+        """
         try:
             response = self.session.get(
                 f"{self.base_url}/sports",
                 params={"apiKey": self.api_key},
                 timeout=10
             )
-            return int(response.headers.get("x-requests-remaining", 0))
+            remaining = response.headers.get("x-requests-remaining")
+            used = response.headers.get("x-requests-used")
+            out = {}
+            if remaining is not None:
+                try:
+                    out["remaining"] = int(remaining)
+                except ValueError:
+                    pass
+            if used is not None:
+                try:
+                    out["used"] = int(used)
+                except ValueError:
+                    pass
+            return out if out else None
         except Exception:
             return None
 
@@ -442,258 +588,591 @@ class ArbitrageCalculator:
             "profit_pct": round(profit_pct, 2),
         }
 
+    @staticmethod
+    def calculate_books_vs_books(
+        odds_side1: float,
+        odds_side2: float,
+        total_investment: float = MAX_STAKE_PER_ARB,
+    ) -> Optional[Dict[str, float]]:
+        """
+        Two-way arb between sportsbooks: best odds on side1 and best on side2.
+        Returns stakes and profit if impl_1 + impl_2 < 1, else None.
+        """
+        impl_1 = american_to_implied_prob(odds_side1)
+        impl_2 = american_to_implied_prob(odds_side2)
+        if impl_1 + impl_2 >= 1.0:
+            return None
+        total_impl = impl_1 + impl_2
+        stake1 = total_investment * (impl_1 / total_impl)
+        stake2 = total_investment * (impl_2 / total_impl)
+        payout1 = stake1 * american_to_decimal(odds_side1)
+        payout2 = stake2 * american_to_decimal(odds_side2)
+        guaranteed_profit = min(payout1, payout2) - total_investment
+        profit_pct = (guaranteed_profit / total_investment) * 100
+        if profit_pct < MIN_PROFIT_PCT:
+            return None
+        return {
+            "side1_stake": round(stake1, 2),
+            "side2_stake": round(stake2, 2),
+            "side1_payout": round(payout1, 2),
+            "side2_payout": round(payout2, 2),
+            "total_investment": round(total_investment, 2),
+            "guaranteed_profit": round(guaranteed_profit, 2),
+            "profit_pct": round(profit_pct, 2),
+        }
+
+
+def format_bet_slip(opp: BookVsBookOpportunity, number: Optional[int] = None) -> str:
+    """
+    Format one arbitrage opportunity as an easy-to-read bet slip:
+    - The two sportsbooks
+    - Recommended bet amount per side, total cost
+    - Payout if each side wins
+    - Guaranteed profit
+    """
+    title = f"  ARB #{number}  " if number is not None else "  ARBITRAGE BET SLIP  "
+    lines = [
+        "",
+        "=" * 60,
+        title.center(60),
+        "=" * 60,
+        f"  {opp.sport}  ·  {opp.home_team}  vs  {opp.away_team}",
+        f"  Game time: {opp.commence_time}",
+        "",
+        "  SPORTSBOOKS USED:",
+        f"    1) {opp.side1_book.upper()}",
+        f"    2) {opp.side2_book.upper()}",
+        "",
+        "  PLACE THESE TWO BETS:",
+        "",
+        f"  BET 1 — {opp.side1_book.upper()}",
+        f"    · Bet ${opp.side1_stake:.2f} on: {opp.side1_team}",
+        f"    · Odds: {opp.side1_odds:+.0f}",
+        f"    · If this wins, you get: ${opp.side1_payout:.2f}",
+        "",
+        f"  BET 2 — {opp.side2_book.upper()}",
+        f"    · Bet ${opp.side2_stake:.2f} on: {opp.side2_team}",
+        f"    · Odds: {opp.side2_odds:+.0f}",
+        f"    · If this wins, you get: ${opp.side2_payout:.2f}",
+        "",
+        "  SUMMARY:",
+        f"    Total cost (both bets):  ${opp.total_investment:.2f}",
+        f"    If {opp.side1_team} wins:  you receive ${opp.side1_payout:.2f}",
+        f"    If {opp.side2_team} wins:  you receive ${opp.side2_payout:.2f}",
+        f"    Guaranteed profit:       ${opp.guaranteed_profit:.2f}  ({opp.profit_pct:.2f}%)",
+        "",
+        "=" * 60,
+    ]
+    return "\n".join(lines)
+
+
+def format_totals_bet_slip(opp: TotalsOpportunity, number: Optional[int] = None) -> str:
+    """Format an over/under arbitrage opportunity as a bet slip."""
+    title = f"  TOTALS ARB #{number}  " if number is not None else "  OVER/UNDER ARBITRAGE  "
+    lines = [
+        "",
+        "=" * 60,
+        title.center(60),
+        "=" * 60,
+        f"  {opp.sport}  ·  {opp.home_team}  vs  {opp.away_team}",
+        f"  Total points line: {opp.point}",
+        f"  Game time: {opp.commence_time}",
+        "",
+        "  SPORTSBOOKS USED:",
+        f"    1) {opp.over_book.upper()} (Over)",
+        f"    2) {opp.under_book.upper()} (Under)",
+        "",
+        "  PLACE THESE TWO BETS:",
+        "",
+        f"  BET 1 — {opp.over_book.upper()} (OVER {opp.point})",
+        f"    · Bet ${opp.over_stake:.2f} on: Over {opp.point}",
+        f"    · Odds: {opp.over_odds:+.0f}",
+        f"    · If Over hits, you get: ${opp.over_payout:.2f}",
+        "",
+        f"  BET 2 — {opp.under_book.upper()} (UNDER {opp.point})",
+        f"    · Bet ${opp.under_stake:.2f} on: Under {opp.point}",
+        f"    · Odds: {opp.under_odds:+.0f}",
+        f"    · If Under hits, you get: ${opp.under_payout:.2f}",
+        "",
+        "  SUMMARY:",
+        f"    Total cost (both bets):  ${opp.total_investment:.2f}",
+        f"    If Over {opp.point}:  you receive ${opp.over_payout:.2f}",
+        f"    If Under {opp.point}:  you receive ${opp.under_payout:.2f}",
+        f"    Guaranteed profit:       ${opp.guaranteed_profit:.2f}  ({opp.profit_pct:.2f}%)",
+        "",
+        "=" * 60,
+    ]
+    return "\n".join(lines)
+
+
+def format_spreads_bet_slip(opp: SpreadsOpportunity, number: Optional[int] = None) -> str:
+    """Format a point-spread arbitrage opportunity as a bet slip."""
+    title = f"  SPREADS ARB #{number}  " if number is not None else "  SPREADS ARBITRAGE  "
+    home_spread = f"{opp.home_point:+.1f}" if opp.home_point != int(opp.home_point) else f"{int(opp.home_point):+d}"
+    away_spread = f"{opp.away_point:+.1f}" if opp.away_point != int(opp.away_point) else f"{int(opp.away_point):+d}"
+    lines = [
+        "",
+        "=" * 60,
+        title.center(60),
+        "=" * 60,
+        f"  {opp.sport}  ·  {opp.home_team}  vs  {opp.away_team}",
+        f"  Spread: {opp.home_team} {home_spread}  /  {opp.away_team} {away_spread}",
+        f"  Game time: {opp.commence_time}",
+        "",
+        "  SPORTSBOOKS USED:",
+        f"    1) {opp.home_book.upper()} ({opp.home_team} {home_spread})",
+        f"    2) {opp.away_book.upper()} ({opp.away_team} {away_spread})",
+        "",
+        "  PLACE THESE TWO BETS:",
+        "",
+        f"  BET 1 — {opp.home_book.upper()}",
+        f"    · Bet ${opp.home_stake:.2f} on: {opp.home_team} {home_spread}",
+        f"    · Odds: {opp.home_odds:+.0f}",
+        f"    · If {opp.home_team} covers, you get: ${opp.home_payout:.2f}",
+        "",
+        f"  BET 2 — {opp.away_book.upper()}",
+        f"    · Bet ${opp.away_stake:.2f} on: {opp.away_team} {away_spread}",
+        f"    · Odds: {opp.away_odds:+.0f}",
+        f"    · If {opp.away_team} covers, you get: ${opp.away_payout:.2f}",
+        "",
+        "  SUMMARY:",
+        f"    Total cost (both bets):  ${opp.total_investment:.2f}",
+        f"    If {opp.home_team} covers:  you receive ${opp.home_payout:.2f}",
+        f"    If {opp.away_team} covers:  you receive ${opp.away_payout:.2f}",
+        f"    Guaranteed profit:         ${opp.guaranteed_profit:.2f}  ({opp.profit_pct:.2f}%)",
+        "",
+        "=" * 60,
+    ]
+    return "\n".join(lines)
+
 
 # --- ARBITRAGE SCANNER ---
 
 class ArbitrageScanner:
-    """Main arbitrage scanning engine"""
+    """Scans The Odds API for sportsbook-vs-sportsbook arbitrage (no Kalshi API)."""
 
     def __init__(self):
         self.odds_client = OddsAPIClient(ODDS_API_KEY)
-        self.kalshi_client = KalshiAPIClient(KALSHI_API_KEY)
-        self.opportunities: List[ArbitrageOpportunity] = []
+        self.opportunities: List[BookVsBookOpportunity] = []
+        self.totals_opportunities: List[TotalsOpportunity] = []
+        self.spreads_opportunities: List[SpreadsOpportunity] = []
 
-    def get_kalshi_series_for_sport(self, sport: Sport) -> Optional[str]:
-        """Map sport to Kalshi series ticker"""
-        mapping = {
-            Sport.NCAAB: "KXNCAAMBGAME",  # NCAA Men's Basketball
-            Sport.NBA: "KXNBAGAME",        # NBA
-            Sport.NFL: "KXNFLGAME",        # NFL
-            # Add more as needed
-        }
-        return mapping.get(sport)
-
-    def scan(self, sport: Sport) -> List[ArbitrageOpportunity]:
+    def scan(self, sport: Sport) -> Tuple[List[BookVsBookOpportunity], List[TotalsOpportunity], List[SpreadsOpportunity]]:
         """
-        Scan for arbitrage opportunities for a given sport.
+        Fetch odds (h2h + totals + spreads) from multiple books; find moneyline, over/under, and spread arbs.
+        Returns (moneyline_opportunities, totals_opportunities, spreads_opportunities).
         """
-        logger.info(f"Starting scan for {sport.name}...")
-        opportunities = []
+        logger.info(f"Starting multi-book scan for {sport.name} (h2h + totals + spreads)...")
+        opportunities: List[BookVsBookOpportunity] = []
+        totals_opps: List[TotalsOpportunity] = []
+        spreads_opps: List[SpreadsOpportunity] = []
 
-        # Fetch odds: use us2 region for HardRock Bet
-        hr_games = self.odds_client.get_odds(
+        games = self.odds_client.get_odds(
             sport,
-            bookmakers=["hardrockbet"],
-            regions=ODDS_REGIONS_FOR_HARDROCK,
+            bookmakers=ODDS_BOOKMAKERS,
+            regions=ODDS_REGIONS_MULTI,
+            markets="h2h,totals,spreads",
         )
+        if not games:
+            logger.info("No games returned from Odds API")
+            return opportunities, totals_opps, spreads_opps
 
-        series_ticker = self.get_kalshi_series_for_sport(sport)
-        if not series_ticker:
-            logger.warning(f"No Kalshi series mapping for {sport.name}")
-            return opportunities
+        for game in games:
+            opp = self._scan_game_books_vs_books(game, sport)
+            if opp:
+                opportunities.append(opp)
+                self._log_book_vs_book_opportunity(opp)
+            for topp in self._scan_game_totals(game, sport):
+                totals_opps.append(topp)
+                logger.info(format_totals_bet_slip(topp))
+            for sopp in self._scan_game_spreads(game, sport):
+                spreads_opps.append(sopp)
+                logger.info(format_spreads_bet_slip(sopp))
 
-        kalshi_markets = self.kalshi_client.get_markets(series_ticker=series_ticker)
-
-        if not hr_games or not kalshi_markets:
-            logger.info("Insufficient data for arbitrage scan")
-            return opportunities
-
-        # Build Kalshi market lookup: match by title (e.g. "Team A vs Team B" or "Team A wins")
-        kalshi_lookup = {
-            m.get("title", ""): m.get("ticker", "")
-            for m in kalshi_markets
-            if m.get("title") and m.get("ticker")
-        }
-        kalshi_titles = list(kalshi_lookup.keys())
-
-        # Scan each HardRock game
-        for game in hr_games:
-            game_opps = self._scan_game(game, kalshi_titles, kalshi_lookup, sport)
-            opportunities.extend(game_opps)
-
-        logger.info(f"Found {len(opportunities)} arbitrage opportunities")
+        logger.info(f"Found {len(opportunities)} moneyline + {len(totals_opps)} totals + {len(spreads_opps)} spreads arbitrage opportunities")
         self.opportunities = opportunities
-        return opportunities
+        self.totals_opportunities = totals_opps
+        self.spreads_opportunities = spreads_opps
+        return opportunities, totals_opps, spreads_opps
 
-    def _scan_game(
+    def scan_multiple_sports(
+        self,
+        sports: Optional[List[Sport]] = None,
+    ) -> Tuple[List[BookVsBookOpportunity], List[TotalsOpportunity], List[SpreadsOpportunity]]:
+        """
+        Scan multiple sports in one run. One API request per sport; results are
+        combined. Returns (moneyline_opps, totals_opps, spreads_opps).
+        """
+        to_scan = sports if sports is not None else SPORTS_TO_SCAN
+        all_h2h: List[BookVsBookOpportunity] = []
+        all_totals: List[TotalsOpportunity] = []
+        all_spreads: List[SpreadsOpportunity] = []
+        for sport in to_scan:
+            h2h_opps, totals_opps, spreads_opps = self.scan(sport)
+            all_h2h.extend(h2h_opps)
+            all_totals.extend(totals_opps)
+            all_spreads.extend(spreads_opps)
+        self.opportunities = all_h2h
+        self.totals_opportunities = all_totals
+        self.spreads_opportunities = all_spreads
+        return all_h2h, all_totals, all_spreads
+
+    def _scan_game_totals(
         self,
         game: Dict,
-        kalshi_titles: List[str],
-        kalshi_lookup: Dict[str, str],
-        sport: Sport
-    ) -> List[ArbitrageOpportunity]:
-        """Scan a single game for arbitrage opportunities"""
-        opportunities = []
-
-        # Extract game info
+        sport: Sport,
+    ) -> List[TotalsOpportunity]:
+        """
+        For one game, collect each book's totals (Over/Under) market; group by point line;
+        for each line find best Over and best Under across books; if arb, return opportunity.
+        """
         game_id = game.get("id", "")
         home_team = game.get("home_team", "")
         away_team = game.get("away_team", "")
         commence_time = game.get("commence_time", "")
-
-        # Get HardRock bookmaker
         bookmakers = game.get("bookmakers", [])
-        hr_book = next(
-            (b for b in bookmakers if b.get("key") == "hardrockbet"),
-            bookmakers[0] if bookmakers else None
-        )
 
-        if not hr_book:
-            return opportunities
+        # Collect (point, book_key, over_odds, under_odds) per book; point rounded to 0.5 for grouping
+        by_point: Dict[float, List[Tuple[str, float, float]]] = {}  # point -> [(book, over_odds, under_odds)]
 
-        # Get head-to-head market
-        markets = hr_book.get("markets", [])
-        h2h_market = next((m for m in markets if m.get("key") == "h2h"), None)
+        for book in bookmakers:
+            bk_key = book.get("key", "")
+            markets = book.get("markets", [])
+            totals_market = next((m for m in markets if m.get("key") == "totals"), None)
+            if not totals_market:
+                continue
+            outcomes = totals_market.get("outcomes", [])
+            over_odds = None
+            under_odds = None
+            point = None
+            for out in outcomes:
+                name = (out.get("name") or "").strip().lower()
+                price = out.get("price")
+                pt = out.get("point")
+                if price is None:
+                    continue
+                if name == "over":
+                    over_odds = float(price)
+                    if pt is not None:
+                        point = float(pt)
+                elif name == "under":
+                    under_odds = float(price)
+                    if pt is not None and point is None:
+                        point = float(pt)
+            if over_odds is None or under_odds is None or point is None:
+                continue
+            # Group by point rounded to 1 decimal (so 234.5 is one line)
+            key = round(point, 1)
+            if key not in by_point:
+                by_point[key] = []
+            by_point[key].append((bk_key, over_odds, under_odds))
 
-        if not h2h_market:
-            return opportunities
+        result: List[TotalsOpportunity] = []
+        total_stake = min(BANKROLL * 0.1, MAX_STAKE_PER_ARB)
 
-        outcomes = h2h_market.get("outcomes", [])
+        for point_key, book_list in by_point.items():
+            if len(book_list) < 2:
+                continue
+            best_over = max(book_list, key=lambda x: x[1])   # (book, over, under)
+            best_under = max(book_list, key=lambda x: x[2])
+            over_odds = best_over[1]
+            under_odds = best_under[2]
+            over_book = best_over[0]
+            under_book = best_under[0]
 
-        # Check each outcome for arbitrage
-        for outcome in outcomes:
-            team_name = outcome.get("name", "")
-            hr_odds = outcome.get("price")
-
-            if hr_odds is None:
+            calc = ArbitrageCalculator.calculate_books_vs_books(over_odds, under_odds, total_stake)
+            if not calc:
                 continue
 
-            # Match with Kalshi market (fuzzy match on full title, e.g. "Duke wins" vs "Duke")
-            match_result = fuzzy_match_teams(team_name, kalshi_titles)
-            if not match_result:
-                continue
-
-            matched_title, match_confidence = match_result
-
-            # Jaccard gate: require real word overlap to avoid false alarms
-            if jaccard_string_similarity(team_name, matched_title) < JACCARD_MIN:
-                continue
-
-            # Same-outcome check: HardRock team name must appear in Kalshi title (avoid wrong team)
-            team_tokens = tokenize_to_set(team_name)
-            title_tokens = tokenize_to_set(matched_title)
-            if team_tokens and not (team_tokens & title_tokens):
-                continue
-
-            kalshi_ticker = kalshi_lookup.get(matched_title)
-
-            if not kalshi_ticker:
-                continue
-
-            # Get Kalshi orderbook
-            orderbook = self.kalshi_client.get_orderbook(kalshi_ticker)
-            if not orderbook:
-                continue
-
-            kalshi_no_price = self.kalshi_client.get_no_bin_price_cents(orderbook)
-            if not kalshi_no_price or kalshi_no_price <= 0:
-                continue
-
-            # Calculate arbitrage
-            arb_calc = ArbitrageCalculator.calculate(
-                float(hr_odds),
-                kalshi_no_price,
-                min(BANKROLL * 0.1, MAX_STAKE_PER_ARB)
-            )
-
-            if not arb_calc:
-                continue
-
-            # Create opportunity object
-            opportunity = ArbitrageOpportunity(
+            result.append(TotalsOpportunity(
                 game_id=game_id,
                 sport=sport.name,
                 home_team=home_team,
                 away_team=away_team,
                 commence_time=commence_time,
-                hr_team=team_name,
-                hr_odds=float(hr_odds),
-                hr_stake=arb_calc["hr_stake"],
-                hr_payout=arb_calc["hr_payout"],
-                hr_implied_prob=american_to_implied_prob(float(hr_odds)),
-                kalshi_ticker=kalshi_ticker,
-                kalshi_title=matched_title,
-                kalshi_no_price_cents=kalshi_no_price,
-                kalshi_stake=arb_calc["kalshi_stake"],
-                kalshi_payout=arb_calc["kalshi_payout"],
-                kalshi_implied_prob=kalshi_no_price / 100.0,
-                total_investment=arb_calc["total_investment"],
-                guaranteed_profit=arb_calc["guaranteed_profit"],
-                profit_percentage=arb_calc["profit_pct"],
-                match_confidence=match_confidence
-            )
+                point=point_key,
+                over_book=over_book,
+                over_odds=over_odds,
+                over_stake=calc["side1_stake"],
+                over_payout=calc["side1_payout"],
+                under_book=under_book,
+                under_odds=under_odds,
+                under_stake=calc["side2_stake"],
+                under_payout=calc["side2_payout"],
+                total_investment=calc["total_investment"],
+                guaranteed_profit=calc["guaranteed_profit"],
+                profit_pct=calc["profit_pct"],
+            ))
 
-            opportunities.append(opportunity)
-            self._log_opportunity(opportunity)
+        return result
 
-        return opportunities
+    def _scan_game_spreads(
+        self,
+        game: Dict,
+        sport: Sport,
+    ) -> List[SpreadsOpportunity]:
+        """
+        For one game, collect each book's spreads market; align outcomes to home/away by team name;
+        group by spread line (home_point); for each line find best home-spread and away-spread odds
+        across books; if arb, return opportunity.
+        """
+        game_id = game.get("id", "")
+        home_team = game.get("home_team", "")
+        away_team = game.get("away_team", "")
+        commence_time = game.get("commence_time", "")
+        bookmakers = game.get("bookmakers", [])
 
-    def _log_opportunity(self, opp: ArbitrageOpportunity):
-        """Log arbitrage opportunity in readable format"""
-        logger.info("=" * 80)
-        logger.info("ARBITRAGE OPPORTUNITY FOUND")
-        logger.info("=" * 80)
-        logger.info(f"Game: {opp.home_team} vs {opp.away_team}")
-        logger.info(f"Sport: {opp.sport} | Commence: {opp.commence_time}")
-        logger.info(f"Match Confidence: {opp.match_confidence}%")
-        logger.info("")
-        logger.info(f"HardRock Side:")
-        logger.info(f"  Team: {opp.hr_team}")
-        logger.info(f"  Odds: {opp.hr_odds:+.0f}")
-        logger.info(f"  Stake: ${opp.hr_stake:.2f}")
-        logger.info(f"  Payout: ${opp.hr_payout:.2f}")
-        logger.info("")
-        logger.info(f"Kalshi Side:")
-        logger.info(f"  Market: {opp.kalshi_title}")
-        logger.info(f"  Ticker: {opp.kalshi_ticker}")
-        logger.info(f"  No BIN (Ask): {opp.kalshi_no_price_cents}¢")
-        logger.info(f"  Stake: ${opp.kalshi_stake:.2f}")
-        logger.info(f"  Payout: ${opp.kalshi_payout:.2f}")
-        logger.info("")
-        logger.info(f"Total Investment: ${opp.total_investment:.2f}")
-        logger.info(f"Guaranteed Profit: ${opp.guaranteed_profit:.2f} ({opp.profit_percentage:.2f}%)")
-        logger.info("=" * 80)
+        # Per-book: (home_point, away_point, home_odds, away_odds); group by (round(home_point, 1), round(away_point, 1))
+        by_line: Dict[Tuple[float, float], List[Tuple[str, float, float]]] = {}  # (h_pt, a_pt) -> [(book, home_odds, away_odds)]
+
+        for book in bookmakers:
+            bk_key = book.get("key", "")
+            markets = book.get("markets", [])
+            spreads_market = next((m for m in markets if m.get("key") == "spreads"), None)
+            if not spreads_market:
+                continue
+            outcomes = spreads_market.get("outcomes", [])
+            if len(outcomes) != 2:
+                continue
+            # Align to home/away by matching outcome name to game teams
+            candidates = [home_team, away_team]
+            home_odds = None
+            away_odds = None
+            home_point = None
+            away_point = None
+            for out in outcomes:
+                name = out.get("name", "")
+                price = out.get("price")
+                point = out.get("point")
+                if price is None:
+                    continue
+                result = fuzzy_match_teams(name, candidates, threshold=50)
+                if not result:
+                    continue
+                which_team, _ = result
+                if which_team == home_team:
+                    home_odds = float(price)
+                    home_point = float(point) if point is not None else None
+                else:
+                    away_odds = float(price)
+                    away_point = float(point) if point is not None else None
+            if home_odds is None or away_odds is None:
+                continue
+            # If API doesn't return point, we can't group across books; skip
+            if home_point is None and away_point is None:
+                continue
+            if home_point is None:
+                home_point = -away_point if away_point is not None else 0.0
+            if away_point is None:
+                away_point = -home_point
+            line_key = (round(home_point, 1), round(away_point, 1))
+            if line_key not in by_line:
+                by_line[line_key] = []
+            by_line[line_key].append((bk_key, home_odds, away_odds))
+
+        result_list: List[SpreadsOpportunity] = []
+        total_stake = min(BANKROLL * 0.1, MAX_STAKE_PER_ARB)
+
+        for (home_pt, away_pt), book_list in by_line.items():
+            if len(book_list) < 2:
+                continue
+            best_home = max(book_list, key=lambda x: x[1])
+            best_away = max(book_list, key=lambda x: x[2])
+            home_odds = best_home[1]
+            away_odds = best_away[2]
+            home_book = best_home[0]
+            away_book = best_away[0]
+
+            calc = ArbitrageCalculator.calculate_books_vs_books(home_odds, away_odds, total_stake)
+            if not calc:
+                continue
+
+            result_list.append(SpreadsOpportunity(
+                game_id=game_id,
+                sport=sport.name,
+                home_team=home_team,
+                away_team=away_team,
+                commence_time=commence_time,
+                home_point=home_pt,
+                away_point=away_pt,
+                home_book=home_book,
+                home_odds=home_odds,
+                home_stake=calc["side1_stake"],
+                home_payout=calc["side1_payout"],
+                away_book=away_book,
+                away_odds=away_odds,
+                away_stake=calc["side2_stake"],
+                away_payout=calc["side2_payout"],
+                total_investment=calc["total_investment"],
+                guaranteed_profit=calc["guaranteed_profit"],
+                profit_pct=calc["profit_pct"],
+            ))
+
+        return result_list
+
+    def _scan_game_books_vs_books(
+        self,
+        game: Dict,
+        sport: Sport,
+    ) -> Optional[BookVsBookOpportunity]:
+        """
+        For one game, align each book's h2h outcomes to home/away, then take
+        best odds per side across books. If impl_home + impl_away < 1, return arb.
+        """
+        game_id = game.get("id", "")
+        home_team = game.get("home_team", "")
+        away_team = game.get("away_team", "")
+        commence_time = game.get("commence_time", "")
+        bookmakers = game.get("bookmakers", [])
+
+        # Per-book (home_odds, away_odds); key = book key
+        book_odds: List[Tuple[str, float, float]] = []  # (book_key, home_odds, away_odds)
+
+        for book in bookmakers:
+            bk_key = book.get("key", "")
+            markets = book.get("markets", [])
+            h2h = next((m for m in markets if m.get("key") == "h2h"), None)
+            if not h2h:
+                continue
+            outcomes = h2h.get("outcomes", [])
+            aligned = align_outcomes_to_home_away(home_team, away_team, outcomes)
+            if aligned:
+                home_odds, away_odds = aligned
+                book_odds.append((bk_key, home_odds, away_odds))
+
+        if len(book_odds) < 2:
+            return None
+
+        # Best odds per side across all books (no favoritism: purely max odds for each side)
+        best_home = max(book_odds, key=lambda x: x[1])  # (book_key, home_odds, away_odds)
+        best_away = max(book_odds, key=lambda x: x[2])
+
+        odds_home = best_home[1]
+        odds_away = best_away[2]
+        book_home = best_home[0]
+        book_away = best_away[0]
+
+        total = min(BANKROLL * 0.1, MAX_STAKE_PER_ARB)
+        calc = ArbitrageCalculator.calculate_books_vs_books(odds_home, odds_away, total)
+        if not calc:
+            return None
+
+        return BookVsBookOpportunity(
+            game_id=game_id,
+            sport=sport.name,
+            home_team=home_team,
+            away_team=away_team,
+            commence_time=commence_time,
+            side1_team=home_team,
+            side1_book=book_home,
+            side1_odds=odds_home,
+            side1_stake=calc["side1_stake"],
+            side1_payout=calc["side1_payout"],
+            side2_team=away_team,
+            side2_book=book_away,
+            side2_odds=odds_away,
+            side2_stake=calc["side2_stake"],
+            side2_payout=calc["side2_payout"],
+            total_investment=calc["total_investment"],
+            guaranteed_profit=calc["guaranteed_profit"],
+            profit_pct=calc["profit_pct"],
+        )
+
+    def _log_book_vs_book_opportunity(self, opp: BookVsBookOpportunity) -> None:
+        """Log a book-vs-book arbitrage opportunity (detailed)."""
+        logger.info(format_bet_slip(opp))
+
+    @staticmethod
+    def print_bet_slips(opportunities: List[BookVsBookOpportunity]) -> None:
+        """Print moneyline opportunities in easy-to-read bet slip format to console."""
+        for i, opp in enumerate(opportunities, 1):
+            slip = format_bet_slip(opp, number=i)
+            print(slip)
+            print()
+
+    @staticmethod
+    def print_totals_slips(opportunities: List[TotalsOpportunity]) -> None:
+        """Print over/under opportunities in bet slip format to console."""
+        for i, opp in enumerate(opportunities, 1):
+            slip = format_totals_bet_slip(opp, number=i)
+            print(slip)
+            print()
+
+    @staticmethod
+    def print_spreads_slips(opportunities: List[SpreadsOpportunity]) -> None:
+        """Print spread opportunities in bet slip format to console."""
+        for i, opp in enumerate(opportunities, 1):
+            slip = format_spreads_bet_slip(opp, number=i)
+            print(slip)
+            print()
 
     def export_to_dict(self) -> List[Dict]:
-        """Export opportunities to dictionary format"""
+        """Export moneyline opportunities to dictionary format."""
         return [asdict(opp) for opp in self.opportunities]
 
 
 # --- MAIN EXECUTION ---
 
 def main():
-    """Main execution function"""
-    logger.info("=" * 80)
-    logger.info("OddsJam-Style Arbitrage Scanner v3.0")
-    logger.info("=" * 80)
+    """Run continuously: scan all sports every SCAN_INTERVAL_SEC until worthwhile arbs are found. Ctrl+C to stop."""
+    print()
+    print("=" * 60)
+    print("  ARBITRAGE SCANNER — Continuous mode")
+    print("  Scans multiple sports & books until arbs appear.")
+    print("  Press Ctrl+C to stop.")
+    print("=" * 60)
+    print()
 
     if not ODDS_API_KEY or ODDS_API_KEY.strip() == "":
         logger.error("Please set ODDS_API_KEY (e.g. export ODDS_API_KEY=your_key or use .env)")
         return
 
-    # Initialize scanner
     scanner = ArbitrageScanner()
+    cycle = 0
 
-    # Check API limits
-    remaining = scanner.odds_client.get_remaining_requests()
-    if remaining is not None:
-        logger.info(f"Odds API requests remaining: {remaining}")
+    try:
+        while True:
+            cycle += 1
+            usage = scanner.odds_client.get_usage()
+            if usage:
+                used = usage.get("used")
+                remaining = usage.get("remaining")
+                if used is not None and remaining is not None:
+                    print(f"  Odds API this period: {used} used, {remaining} remaining")
+                    logger.info(f"[Cycle {cycle}] Odds API: {used} used, {remaining} remaining this period")
+                elif remaining is not None:
+                    print(f"  Odds API remaining: {remaining}")
+                    logger.info(f"[Cycle {cycle}] Odds API requests remaining: {remaining}")
 
-    # Scan for opportunities (default: NCAAB; change Sport.NBA, Sport.NFL, etc. as needed)
-    sport = Sport.NCAAB
-    opportunities = scanner.scan(sport)
+            h2h_opps, totals_opps, spreads_opps = scanner.scan_multiple_sports()
+            sorted_h2h = sorted(h2h_opps, key=lambda x: x.profit_pct, reverse=True)
+            sorted_totals = sorted(totals_opps, key=lambda x: x.profit_pct, reverse=True)
+            sorted_spreads = sorted(spreads_opps, key=lambda x: x.profit_pct, reverse=True)
+            has_any = sorted_h2h or sorted_totals or sorted_spreads
 
-    if opportunities:
-        logger.info(f"\n✓ Found {len(opportunities)} profitable arbitrage opportunities!")
+            if has_any:
+                logger.info(f"Found {len(sorted_h2h)} moneyline + {len(sorted_totals)} totals + {len(sorted_spreads)} spreads arb(s). Showing bet slips.")
+                print()
+                print("\n  *** WORTHWHILE ARBS FOUND — PLACE THESE BETS ***\n")
+                if sorted_h2h:
+                    print("  --- MONEYLINE (H2H) ---\n")
+                    ArbitrageScanner.print_bet_slips(sorted_h2h)
+                if sorted_totals:
+                    print("  --- OVER/UNDER (TOTALS) ---\n")
+                    ArbitrageScanner.print_totals_slips(sorted_totals)
+                if sorted_spreads:
+                    print("  --- SPREADS ---\n")
+                    ArbitrageScanner.print_spreads_slips(sorted_spreads)
+                print("  Next scan in", SCAN_INTERVAL_SEC, "seconds...")
+            else:
+                logger.info(f"[Cycle {cycle}] No arbs this round. Next scan in {SCAN_INTERVAL_SEC}s.")
 
-        # Sort by profit percentage
-        sorted_opps = sorted(
-            opportunities,
-            key=lambda x: x.profit_percentage,
-            reverse=True
-        )
+            time.sleep(SCAN_INTERVAL_SEC)
 
-        logger.info("\nTop Opportunities:")
-        for i, opp in enumerate(sorted_opps[:5], 1):
-            logger.info(
-                f"{i}. {opp.hr_team} | "
-                f"${opp.guaranteed_profit:.2f} ({opp.profit_percentage:.2f}%) | "
-                f"Confidence: {opp.match_confidence}%"
-            )
-    else:
-        logger.info("\nNo arbitrage opportunities found in this scan.")
-
-    logger.info("\nScan complete.")
+    except KeyboardInterrupt:
+        print()
+        logger.info("Stopped by user (Ctrl+C).")
+        print("Scan stopped.")
 
 
 if __name__ == "__main__":
