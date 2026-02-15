@@ -6,6 +6,7 @@ Version: 3.0
 """
 
 import os
+import re
 import time
 import logging
 from datetime import datetime
@@ -48,8 +49,10 @@ ODDS_API_DELAY = 1.0
 KALSHI_API_DELAY = 0.5
 
 # Matching Parameters
-FUZZY_MATCH_THRESHOLD = 50 
+FUZZY_MATCH_THRESHOLD = 60
 MIN_MATCH_CONFIDENCE = 50
+# Jaccard (word-set overlap): reject fuzzy match if overlap below this (reduces false alarms)
+JACCARD_MIN = 0.2
 
 # Logging Configuration
 logging.basicConfig(
@@ -150,6 +153,28 @@ def normalize_team_name(name: str) -> str:
     for old, new in replacements.items():
         normalized = normalized.replace(old, new)
     return normalized.lower()
+
+
+def tokenize_to_set(text: str) -> set:
+    """Normalize and tokenize into set of words (alphanumeric). Used for Jaccard."""
+    normalized = normalize_team_name(text)
+    words = re.findall(r"[a-z0-9]+", normalized)
+    return set(w for w in words if len(w) > 1)
+
+
+def jaccard_similarity(set_a: set, set_b: set) -> float:
+    """Jaccard = |A ∩ B| / |A ∪ B|. Returns 0 if both sets empty."""
+    if not set_a and not set_b:
+        return 1.0
+    union = set_a | set_b
+    if not union:
+        return 0.0
+    return len(set_a & set_b) / len(union)
+
+
+def jaccard_string_similarity(a: str, b: str) -> float:
+    """Jaccard similarity between two strings (word-set overlap)."""
+    return jaccard_similarity(tokenize_to_set(a), tokenize_to_set(b))
 
 
 def fuzzy_match_teams(
@@ -303,32 +328,56 @@ class KalshiAPIClient:
         except requests.RequestException:
             return None
 
-    def calculate_no_price(self, orderbook: Dict) -> Optional[int]:
+    def get_no_bin_price_cents(self, orderbook: Dict) -> Optional[int]:
         """
-        Calculate the price to BUY No from orderbook.
-        No buy price = 100 - best Yes bid (in cents).
-        Kalshi orderbook format: orderbook.orderbook.yes = [[price, quantity], ...]
-        """
-        ob = orderbook.get("orderbook") or orderbook.get("orderbook_fp") or {}
-        yes_bids = ob.get("yes", [])
+        Return the Buy-It-Now (BIN) price to BUY No contracts, in cents.
 
-        if not yes_bids:
+        BIN = lowest No ASK = price at which you can immediately buy No.
+        Per Kalshi: Best No ASK = 100 - (best Yes BID). API returns bids only.
+        Supports orderbook.yes (cents) and orderbook_fp.yes_dollars (dollar strings).
+        """
+        def extract_yes_bid_prices_cents(ob: Dict) -> List[int]:
+            prices: List[int] = []
+            # Legacy: orderbook.yes = [[price_cents, quantity], ...]
+            for level in ob.get("yes", []):
+                if isinstance(level, (list, tuple)) and len(level) >= 1:
+                    try:
+                        p = int(level[0])
+                        if 1 <= p <= 99:
+                            prices.append(p)
+                    except (ValueError, TypeError):
+                        pass
+                elif isinstance(level, dict) and "price" in level:
+                    try:
+                        p = int(level["price"])
+                        if 1 <= p <= 99:
+                            prices.append(p)
+                    except (ValueError, TypeError):
+                        pass
+            if prices:
+                return prices
+            # orderbook_fp: yes_dollars = [["0.42", count], ...]
+            for level in ob.get("yes_dollars", []):
+                if isinstance(level, (list, tuple)) and len(level) >= 1:
+                    try:
+                        cents = int(round(float(str(level[0]).strip()) * 100))
+                        if 1 <= cents <= 99:
+                            prices.append(cents)
+                    except (ValueError, TypeError):
+                        pass
+            return prices
+
+        ob_legacy = orderbook.get("orderbook") or {}
+        ob_fp = orderbook.get("orderbook_fp") or {}
+        yes_prices = extract_yes_bid_prices_cents(ob_legacy) or extract_yes_bid_prices_cents(ob_fp)
+
+        if not yes_prices:
             return None
 
-        prices = []
-        for level in yes_bids:
-            if isinstance(level, (list, tuple)) and len(level) >= 1:
-                prices.append(int(level[0]))
-            elif isinstance(level, dict) and "price" in level:
-                prices.append(int(level["price"]))
+        best_yes_bid = max(yes_prices)
+        no_ask_cents = 100 - best_yes_bid  # BIN for No = lowest No ask
 
-        if not prices:
-            return None
-
-        best_yes_bid = max(prices)
-        no_buy_price = 100 - best_yes_bid
-
-        return no_buy_price if no_buy_price > 0 else None
+        return no_ask_cents if no_ask_cents > 0 else None
 
 
 # --- ARBITRAGE CALCULATOR ---
@@ -505,6 +554,17 @@ class ArbitrageScanner:
                 continue
 
             matched_title, match_confidence = match_result
+
+            # Jaccard gate: require real word overlap to avoid false alarms
+            if jaccard_string_similarity(team_name, matched_title) < JACCARD_MIN:
+                continue
+
+            # Same-outcome check: HardRock team name must appear in Kalshi title (avoid wrong team)
+            team_tokens = tokenize_to_set(team_name)
+            title_tokens = tokenize_to_set(matched_title)
+            if team_tokens and not (team_tokens & title_tokens):
+                continue
+
             kalshi_ticker = kalshi_lookup.get(matched_title)
 
             if not kalshi_ticker:
@@ -515,7 +575,7 @@ class ArbitrageScanner:
             if not orderbook:
                 continue
 
-            kalshi_no_price = self.kalshi_client.calculate_no_price(orderbook)
+            kalshi_no_price = self.kalshi_client.get_no_bin_price_cents(orderbook)
             if not kalshi_no_price or kalshi_no_price <= 0:
                 continue
 
@@ -576,7 +636,7 @@ class ArbitrageScanner:
         logger.info(f"Kalshi Side:")
         logger.info(f"  Market: {opp.kalshi_title}")
         logger.info(f"  Ticker: {opp.kalshi_ticker}")
-        logger.info(f"  No Price: {opp.kalshi_no_price_cents}¢")
+        logger.info(f"  No BIN (Ask): {opp.kalshi_no_price_cents}¢")
         logger.info(f"  Stake: ${opp.kalshi_stake:.2f}")
         logger.info(f"  Payout: ${opp.kalshi_payout:.2f}")
         logger.info("")
