@@ -1,0 +1,25 @@
+# Environment and secrets
+.env
+.env.local
+*.key
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+env/
+
+# Logs
+*.log
+arbitrage_scanner.log
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
