@@ -9,7 +9,7 @@ import os
 import re
 import time
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass, asdict
 from enum import Enum
@@ -622,7 +622,18 @@ class ArbitrageCalculator:
         }
 
 
-def format_bet_slip(opp: BookVsBookOpportunity, number: Optional[int] = None) -> str:
+def is_live(commence_time: str) -> bool:
+    """True if game has already started (commence_time in the past, UTC)."""
+    if not commence_time:
+        return False
+    try:
+        start = datetime.fromisoformat(commence_time.replace("Z", "+00:00"))
+        return start <= datetime.now(timezone.utc)
+    except (ValueError, TypeError):
+        return False
+
+
+def format_bet_slip(opp: BookVsBookOpportunity, number: Optional[int] = None, live: Optional[bool] = None) -> str:
     """
     Format one arbitrage opportunity as an easy-to-read bet slip:
     - The two sportsbooks
@@ -631,6 +642,8 @@ def format_bet_slip(opp: BookVsBookOpportunity, number: Optional[int] = None) ->
     - Guaranteed profit
     """
     title = f"  ARB #{number}  " if number is not None else "  ARBITRAGE BET SLIP  "
+    if live is not None:
+        title = title.strip() + f"  —  {'LIVE' if live else 'PREGAME'}  "
     lines = [
         "",
         "=" * 60,
@@ -666,9 +679,11 @@ def format_bet_slip(opp: BookVsBookOpportunity, number: Optional[int] = None) ->
     return "\n".join(lines)
 
 
-def format_totals_bet_slip(opp: TotalsOpportunity, number: Optional[int] = None) -> str:
+def format_totals_bet_slip(opp: TotalsOpportunity, number: Optional[int] = None, live: Optional[bool] = None) -> str:
     """Format an over/under arbitrage opportunity as a bet slip."""
     title = f"  TOTALS ARB #{number}  " if number is not None else "  OVER/UNDER ARBITRAGE  "
+    if live is not None:
+        title = title.strip() + f"  —  {'LIVE' if live else 'PREGAME'}  "
     lines = [
         "",
         "=" * 60,
@@ -705,9 +720,11 @@ def format_totals_bet_slip(opp: TotalsOpportunity, number: Optional[int] = None)
     return "\n".join(lines)
 
 
-def format_spreads_bet_slip(opp: SpreadsOpportunity, number: Optional[int] = None) -> str:
+def format_spreads_bet_slip(opp: SpreadsOpportunity, number: Optional[int] = None, live: Optional[bool] = None) -> str:
     """Format a point-spread arbitrage opportunity as a bet slip."""
     title = f"  SPREADS ARB #{number}  " if number is not None else "  SPREADS ARBITRAGE  "
+    if live is not None:
+        title = title.strip() + f"  —  {'LIVE' if live else 'PREGAME'}  "
     home_spread = f"{opp.home_point:+.1f}" if opp.home_point != int(opp.home_point) else f"{int(opp.home_point):+d}"
     away_spread = f"{opp.away_point:+.1f}" if opp.away_point != int(opp.away_point) else f"{int(opp.away_point):+d}"
     lines = [
@@ -784,10 +801,10 @@ class ArbitrageScanner:
                 self._log_book_vs_book_opportunity(opp)
             for topp in self._scan_game_totals(game, sport):
                 totals_opps.append(topp)
-                logger.info(format_totals_bet_slip(topp))
+                logger.info(format_totals_bet_slip(topp, live=is_live(topp.commence_time)))
             for sopp in self._scan_game_spreads(game, sport):
                 spreads_opps.append(sopp)
-                logger.info(format_spreads_bet_slip(sopp))
+                logger.info(format_spreads_bet_slip(sopp, live=is_live(sopp.commence_time)))
 
         logger.info(f"Found {len(opportunities)} moneyline + {len(totals_opps)} totals + {len(spreads_opps)} spreads arbitrage opportunities")
         self.opportunities = opportunities
@@ -1080,13 +1097,13 @@ class ArbitrageScanner:
 
     def _log_book_vs_book_opportunity(self, opp: BookVsBookOpportunity) -> None:
         """Log a book-vs-book arbitrage opportunity (detailed)."""
-        logger.info(format_bet_slip(opp))
+        logger.info(format_bet_slip(opp, live=is_live(opp.commence_time)))
 
     @staticmethod
     def print_bet_slips(opportunities: List[BookVsBookOpportunity]) -> None:
         """Print moneyline opportunities in easy-to-read bet slip format to console."""
         for i, opp in enumerate(opportunities, 1):
-            slip = format_bet_slip(opp, number=i)
+            slip = format_bet_slip(opp, number=i, live=is_live(opp.commence_time))
             print(slip)
             print()
 
@@ -1094,7 +1111,7 @@ class ArbitrageScanner:
     def print_totals_slips(opportunities: List[TotalsOpportunity]) -> None:
         """Print over/under opportunities in bet slip format to console."""
         for i, opp in enumerate(opportunities, 1):
-            slip = format_totals_bet_slip(opp, number=i)
+            slip = format_totals_bet_slip(opp, number=i, live=is_live(opp.commence_time))
             print(slip)
             print()
 
@@ -1102,7 +1119,7 @@ class ArbitrageScanner:
     def print_spreads_slips(opportunities: List[SpreadsOpportunity]) -> None:
         """Print spread opportunities in bet slip format to console."""
         for i, opp in enumerate(opportunities, 1):
-            slip = format_spreads_bet_slip(opp, number=i)
+            slip = format_spreads_bet_slip(opp, number=i, live=is_live(opp.commence_time))
             print(slip)
             print()
 
@@ -1151,18 +1168,46 @@ def main():
             has_any = sorted_h2h or sorted_totals or sorted_spreads
 
             if has_any:
+                # Split into LIVE (act fast) and PREGAME (stick around longer)
+                live_h2h = [o for o in sorted_h2h if is_live(o.commence_time)]
+                pregame_h2h = [o for o in sorted_h2h if not is_live(o.commence_time)]
+                live_totals = [o for o in sorted_totals if is_live(o.commence_time)]
+                pregame_totals = [o for o in sorted_totals if not is_live(o.commence_time)]
+                live_spreads = [o for o in sorted_spreads if is_live(o.commence_time)]
+                pregame_spreads = [o for o in sorted_spreads if not is_live(o.commence_time)]
+
                 logger.info(f"Found {len(sorted_h2h)} moneyline + {len(sorted_totals)} totals + {len(sorted_spreads)} spreads arb(s). Showing bet slips.")
                 print()
                 print("\n  *** WORTHWHILE ARBS FOUND — PLACE THESE BETS ***\n")
-                if sorted_h2h:
-                    print("  --- MONEYLINE (H2H) ---\n")
-                    ArbitrageScanner.print_bet_slips(sorted_h2h)
-                if sorted_totals:
-                    print("  --- OVER/UNDER (TOTALS) ---\n")
-                    ArbitrageScanner.print_totals_slips(sorted_totals)
-                if sorted_spreads:
-                    print("  --- SPREADS ---\n")
-                    ArbitrageScanner.print_spreads_slips(sorted_spreads)
+
+                # LIVE first (act fast)
+                has_live = live_h2h or live_totals or live_spreads
+                if has_live:
+                    print("  ==========  LIVE (act fast)  ==========\n")
+                    if live_h2h:
+                        print("  --- MONEYLINE (H2H) ---\n")
+                        ArbitrageScanner.print_bet_slips(live_h2h)
+                    if live_totals:
+                        print("  --- OVER/UNDER (TOTALS) ---\n")
+                        ArbitrageScanner.print_totals_slips(live_totals)
+                    if live_spreads:
+                        print("  --- SPREADS ---\n")
+                        ArbitrageScanner.print_spreads_slips(live_spreads)
+
+                # PREGAME (more time)
+                has_pregame = pregame_h2h or pregame_totals or pregame_spreads
+                if has_pregame:
+                    print("  ==========  PREGAME  ==========\n")
+                    if pregame_h2h:
+                        print("  --- MONEYLINE (H2H) ---\n")
+                        ArbitrageScanner.print_bet_slips(pregame_h2h)
+                    if pregame_totals:
+                        print("  --- OVER/UNDER (TOTALS) ---\n")
+                        ArbitrageScanner.print_totals_slips(pregame_totals)
+                    if pregame_spreads:
+                        print("  --- SPREADS ---\n")
+                        ArbitrageScanner.print_spreads_slips(pregame_spreads)
+
                 print("  Next scan in", SCAN_INTERVAL_SEC, "seconds...")
             else:
                 logger.info(f"[Cycle {cycle}] No arbs this round. Next scan in {SCAN_INTERVAL_SEC}s.")
