@@ -1,12 +1,13 @@
 """
 Sportsbook-vs-Sportsbook Arbitrage Scanner
-Uses The Odds API to fetch odds from multiple books (DraftKings, FanDuel, HardRock, BetMGM, PointsBet, BetRivers, Fanatics, ESPN Bet)
-and finds arbitrage opportunities between them (best odds per side across books).
+Uses The Odds API to fetch odds from all NY-available sportsbooks (us + us2).
+Scans every book against every other; best odds per side across books. Markets: h2h, totals, spreads.
 Version: 4.0
 """
 
 import os
 import re
+import sys
 import time
 import logging
 from datetime import datetime, timezone
@@ -25,18 +26,32 @@ import requests
 from rapidfuzz import fuzz, process
 
 # --- CONFIGURATION ---
-ODDS_API_KEY = (os.environ.get("ODDS_API_KEY") or "e726408c4318682dffc023e260baeb9b").strip()
+ODDS_API_KEY = (os.environ.get("ODDS_API_KEY") or "862942ef3e86e6ca99daf3e24c95bdc4").strip()
 KALSHI_API_KEY = os.environ.get("KALSHI_API_KEY", "").strip()
 KALSHI_API_URL = "https://api.elections.kalshi.com/trade-api/v2"
 ODDS_API_URL = "https://api.the-odds-api.com/v4"
 
-ODDS_REGIONS_FOR_HARDROCK = "us2"
-ODDS_BOOKMAKERS = ["draftkings", "fanduel", "hardrockbet", "betmgm", "pointsbetus", "betrivers", "fanatics", "espnbet"]
+# NY-available books: Odds API "us" + "us2" state-licensed bookmakers (DraftKings, FanDuel, Caesars, BetMGM, BetRivers, Fanatics, ESPN Bet, Hard Rock, Bally).
+# Caesars = williamhill_us. We scan all books against each other; best odds per side across books.
+ODDS_REGIONS_FOR_HARDROCK = "us"
+ODDS_BOOKMAKERS = [
+    "draftkings",
+    "fanduel",
+    "betmgm",
+    "betrivers",
+    "fanatics",
+    "williamhill_us",   # Caesars
+    "espnbet",          # ESPN Bet / theScore Bet (us2)
+    "hardrockbet",     # us2
+    "ballybet",        # us2
+]
 ODDS_REGIONS_MULTI = "us,us2"
 
 BANKROLL = 1000.00
 MIN_PROFIT_PCT = 1.0
 MAX_STAKE_PER_ARB = 1000.00
+# Max allowed on any single leg; we size so the larger leg equals this to maximize profit.
+MAX_STAKE_PER_SIDE = 250.00
 KELLY_FRACTION = 0.1
 
 KALSHI_TAKER_FEE = 0.01
@@ -46,6 +61,9 @@ ODDS_API_DELAY = 1.0
 KALSHI_API_DELAY = 0.5
 
 SCAN_INTERVAL_SEC = 15
+
+# Stop the program when this many credits have been used in the current period.
+ODDS_API_CREDITS_LIMIT = 450
 
 FUZZY_MATCH_THRESHOLD = 60
 MIN_MATCH_CONFIDENCE = 50
@@ -264,9 +282,19 @@ def fuzzy_match_teams(
 
 
 def is_live(commence_time: str) -> bool:
+    """True if game has already started (commence_time <= now UTC)."""
     try:
         start = datetime.fromisoformat(commence_time.replace("Z", "+00:00"))
         return start <= datetime.now(timezone.utc)
+    except (ValueError, TypeError):
+        return False
+
+
+def is_pregame(commence_time: str) -> bool:
+    """True if game start is in the future (commence_time > now UTC). Used for labeling and grouping slips."""
+    try:
+        start = datetime.fromisoformat(commence_time.replace("Z", "+00:00"))
+        return start > datetime.now(timezone.utc)
     except (ValueError, TypeError):
         return False
 
@@ -287,23 +315,32 @@ def _link_for_new_jersey(link: Optional[str], book_key: str) -> Optional[str]:
             q = parse_qs(parsed.query)
             q["intendedSiteExp"] = ["US-NJ-SB"]
             new_query = urlencode(q, doseq=True)
-            return urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query, parsed.fragment))
+            out = urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query, parsed.fragment))
+            return out.replace("{state}", "NJ")
         if key == "fanduel":
             q = parse_qs(parsed.query)
             q["state"] = ["NJ"]
             new_query = urlencode(q, doseq=True)
-            return urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query, parsed.fragment))
+            out = urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query, parsed.fragment))
+            return out.replace("{state}", "NJ")
         if key == "betmgm":
-            netloc = parsed.netloc.replace("betmgm.com", "nj.betmgm.com")
-            return urlunparse((parsed.scheme, netloc, parsed.path, parsed.params, parsed.query, parsed.fragment))
+            # NJ format per reference: https://www.nj.betmgm.com/en/sports?...
+            netloc = "www.nj.betmgm.com"
+            path = (parsed.path or "").strip() or "/en/sports"
+            if not path.startswith("/"):
+                path = "/" + path
+            query = (parsed.query or "").replace("{state}", "NJ")
+            out = urlunparse(("https", netloc, path, parsed.params, query, parsed.fragment))
+            return out.replace("{state}", "NJ")
         if key == "hardrockbet":
             q = parse_qs(parsed.query)
             q["state"] = ["NJ"]
             new_query = urlencode(q, doseq=True)
-            return urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query, parsed.fragment))
+            out = urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query, parsed.fragment))
+            return out.replace("{state}", "NJ")
     except Exception:
         pass
-    return link
+    return link.replace("{state}", "NJ") if link else link
 
 
 def _kalshi_contract_price_cents(american_odds: float) -> int:
@@ -542,12 +579,18 @@ class ArbitrageCalculator:
     def calculate_books_vs_books(
         odds_side1: float,
         odds_side2: float,
-        total_investment: float,
+        total_investment: Optional[float] = None,
+        max_stake_per_side: Optional[float] = None,
     ) -> Optional[Dict]:
         impl_1 = american_to_implied_prob(odds_side1)
         impl_2 = american_to_implied_prob(odds_side2)
         total_impl = impl_1 + impl_2
         if total_impl >= 1.0:
+            return None
+        # Size so the larger leg equals max_stake_per_side to maximize dollar profit (profit % is fixed by odds)
+        if max_stake_per_side is not None and max_stake_per_side > 0:
+            total_investment = max_stake_per_side * (total_impl / max(impl_1, impl_2))
+        if total_investment is None or total_investment <= 0:
             return None
         stake1 = total_investment * (impl_1 / total_impl)
         stake2 = total_investment * (impl_2 / total_impl)
@@ -596,6 +639,7 @@ class ArbitrageScanner:
             logger.info("No games returned from Odds API")
             return opportunities, totals_opps, spreads_opps
 
+        # Scan all games (live and pregame); slips are labeled LIVE vs PREGAME and grouped accordingly
         for game in games:
             opp = self._scan_game_books_vs_books(game, sport)
             if opp:
@@ -685,7 +729,6 @@ class ArbitrageScanner:
             by_point[key].append((bk_key, over_odds, under_odds, over_link, under_link))
 
         result: List[TotalsOpportunity] = []
-        total_stake = min(BANKROLL * 0.1, MAX_STAKE_PER_ARB)
 
         for point_key, book_list in by_point.items():
             if len(book_list) < 2:
@@ -699,7 +742,9 @@ class ArbitrageScanner:
             over_link = best_over[3] if len(best_over) > 3 else None
             under_link = best_under[4] if len(best_under) > 4 else None
 
-            calc = ArbitrageCalculator.calculate_books_vs_books(over_odds, under_odds, total_stake)
+            calc = ArbitrageCalculator.calculate_books_vs_books(
+                over_odds, under_odds, max_stake_per_side=MAX_STAKE_PER_SIDE
+            )
             if not calc:
                 continue
 
@@ -792,7 +837,6 @@ class ArbitrageScanner:
             by_line[line_key].append((bk_key, home_odds, away_odds, home_link, away_link))
 
         result_list: List[SpreadsOpportunity] = []
-        total_stake = min(BANKROLL * 0.1, MAX_STAKE_PER_ARB)
 
         for (home_pt, away_pt), book_list in by_line.items():
             if len(book_list) < 2:
@@ -806,7 +850,9 @@ class ArbitrageScanner:
             home_link = best_home[3] if len(best_home) > 3 else None
             away_link = best_away[4] if len(best_away) > 4 else None
 
-            calc = ArbitrageCalculator.calculate_books_vs_books(home_odds, away_odds, total_stake)
+            calc = ArbitrageCalculator.calculate_books_vs_books(
+                home_odds, away_odds, max_stake_per_side=MAX_STAKE_PER_SIDE
+            )
             if not calc:
                 continue
 
@@ -898,8 +944,9 @@ class ArbitrageScanner:
         home_link = best_home[3] if len(best_home) > 3 else None
         away_link = best_away[4] if len(best_away) > 4 else None
 
-        total = min(BANKROLL * 0.1, MAX_STAKE_PER_ARB)
-        calc = ArbitrageCalculator.calculate_books_vs_books(odds_home, odds_away, total)
+        calc = ArbitrageCalculator.calculate_books_vs_books(
+            odds_home, odds_away, max_stake_per_side=MAX_STAKE_PER_SIDE
+        )
         if not calc:
             return None
 
@@ -953,13 +1000,16 @@ def main() -> None:
         return
 
     scanner = ArbitrageScanner()
-    cycle = 0
 
     # Show Odds API credits at startup
     usage = scanner.odds_client.get_usage()
     if usage:
         remaining = usage.get("remaining")
         used = usage.get("used")
+        if used is not None and used >= ODDS_API_CREDITS_LIMIT:
+            logger.warning(f"Odds API credits already at or above limit ({used} >= {ODDS_API_CREDITS_LIMIT}). Exiting.")
+            print(f"  Odds API: {used} credits used (limit {ODDS_API_CREDITS_LIMIT}). Exiting.")
+            sys.exit(0)
         if remaining is not None:
             msg = f"  Odds API credits: {remaining} remaining"
             if used is not None:
@@ -968,70 +1018,78 @@ def main() -> None:
         logger.info(f"Odds API at startup: {usage}")
 
     try:
-        while True:
-            cycle += 1
-            logger.info(f"[Cycle {cycle}] Scanning {[s.name for s in SPORTS_TO_SCAN]}...")
-            usage = scanner.odds_client.get_usage()
-            if usage:
-                used = usage.get("used")
-                remaining = usage.get("remaining")
-                if remaining is not None:
-                    msg = f"  Odds API credits: {remaining} remaining"
-                    if used is not None:
-                        msg += f"  ({used} used this period)"
-                    print(msg)
-                    logger.info(f"Odds API: used={used}, remaining={remaining}")
-                elif used is not None:
-                    logger.info(f"Odds API: used={used}")
+        logger.info(f"Scanning {[s.name for s in SPORTS_TO_SCAN]} (single run)...")
+        usage = scanner.odds_client.get_usage()
+        if usage:
+            used = usage.get("used")
+            remaining = usage.get("remaining")
+            if used is not None and used >= ODDS_API_CREDITS_LIMIT:
+                logger.warning(f"Odds API credits at limit ({used} >= {ODDS_API_CREDITS_LIMIT}). Exiting.")
+                print(f"  Odds API: {used} credits used (limit {ODDS_API_CREDITS_LIMIT}). Exiting.")
+                sys.exit(0)
+            if remaining is not None:
+                msg = f"  Odds API credits: {remaining} remaining"
+                if used is not None:
+                    msg += f"  ({used} used this period)"
+                print(msg)
+                logger.info(f"Odds API: used={used}, remaining={remaining}")
+            elif used is not None:
+                logger.info(f"Odds API: used={used}")
 
-            h2h_opps, totals_opps, spreads_opps = scanner.scan_multiple_sports()
-            sorted_h2h = sorted(h2h_opps, key=lambda x: x.profit_pct, reverse=True)
-            sorted_totals = sorted(totals_opps, key=lambda x: x.profit_pct, reverse=True)
-            sorted_spreads = sorted(spreads_opps, key=lambda x: x.profit_pct, reverse=True)
-            has_any = sorted_h2h or sorted_totals or sorted_spreads
+        h2h_opps, totals_opps, spreads_opps = scanner.scan_multiple_sports()
 
-            if has_any:
-                live_h2h = [o for o in sorted_h2h if is_live(o.commence_time)]
-                pregame_h2h = [o for o in sorted_h2h if not is_live(o.commence_time)]
-                live_totals = [o for o in sorted_totals if is_live(o.commence_time)]
-                pregame_totals = [o for o in sorted_totals if not is_live(o.commence_time)]
-                live_spreads = [o for o in sorted_spreads if is_live(o.commence_time)]
-                pregame_spreads = [o for o in sorted_spreads if not is_live(o.commence_time)]
+        # Check again after scan (we just used more credits); exit if at limit
+        usage = scanner.odds_client.get_usage()
+        if usage and usage.get("used") is not None and usage.get("used") >= ODDS_API_CREDITS_LIMIT:
+            used = usage.get("used")
+            logger.warning(f"Odds API credits at limit after scan ({used} >= {ODDS_API_CREDITS_LIMIT}). Exiting.")
+            print(f"  Odds API: {used} credits used (limit {ODDS_API_CREDITS_LIMIT}). Exiting.")
+            sys.exit(0)
+        sorted_h2h = sorted(h2h_opps, key=lambda x: x.profit_pct, reverse=True)
+        sorted_totals = sorted(totals_opps, key=lambda x: x.profit_pct, reverse=True)
+        sorted_spreads = sorted(spreads_opps, key=lambda x: x.profit_pct, reverse=True)
+        has_any = sorted_h2h or sorted_totals or sorted_spreads
 
-                logger.info(f"Found {len(sorted_h2h)} moneyline + {len(sorted_totals)} totals + {len(sorted_spreads)} spreads")
-                print("\n  *** WORTHWHILE ARBS FOUND — PLACE THESE BETS ***\n")
+        if has_any:
+            live_h2h = [o for o in sorted_h2h if is_live(o.commence_time)]
+            pregame_h2h = [o for o in sorted_h2h if not is_live(o.commence_time)]
+            live_totals = [o for o in sorted_totals if is_live(o.commence_time)]
+            pregame_totals = [o for o in sorted_totals if not is_live(o.commence_time)]
+            live_spreads = [o for o in sorted_spreads if is_live(o.commence_time)]
+            pregame_spreads = [o for o in sorted_spreads if not is_live(o.commence_time)]
 
-                has_live = live_h2h or live_totals or live_spreads
-                if has_live:
-                    print("  ==========  LIVE (act fast)  ==========\n")
-                    if live_h2h:
-                        print("  --- MONEYLINE (H2H) ---\n")
-                        ArbitrageScanner.print_bet_slips(live_h2h)
-                    if live_totals:
-                        print("  --- OVER/UNDER (TOTALS) ---\n")
-                        ArbitrageScanner.print_totals_slips(live_totals)
-                    if live_spreads:
-                        print("  --- SPREADS ---\n")
-                        ArbitrageScanner.print_spreads_slips(live_spreads)
+            logger.info(f"Found {len(sorted_h2h)} moneyline + {len(sorted_totals)} totals + {len(sorted_spreads)} spreads")
+            print("\n  *** WORTHWHILE ARBS FOUND — PLACE THESE BETS ***\n")
 
-                has_pregame = pregame_h2h or pregame_totals or pregame_spreads
-                if has_pregame:
-                    print("  ==========  PREGAME  ==========\n")
-                    if pregame_h2h:
-                        print("  --- MONEYLINE (H2H) ---\n")
-                        ArbitrageScanner.print_bet_slips(pregame_h2h)
-                    if pregame_totals:
-                        print("  --- OVER/UNDER (TOTALS) ---\n")
-                        ArbitrageScanner.print_totals_slips(pregame_totals)
-                    if pregame_spreads:
-                        print("  --- SPREADS ---\n")
-                        ArbitrageScanner.print_spreads_slips(pregame_spreads)
+            has_live = live_h2h or live_totals or live_spreads
+            if has_live:
+                print("  ==========  LIVE (act fast)  ==========\n")
+                if live_h2h:
+                    print("  --- MONEYLINE (H2H) ---\n")
+                    ArbitrageScanner.print_bet_slips(live_h2h)
+                if live_totals:
+                    print("  --- OVER/UNDER (TOTALS) ---\n")
+                    ArbitrageScanner.print_totals_slips(live_totals)
+                if live_spreads:
+                    print("  --- SPREADS ---\n")
+                    ArbitrageScanner.print_spreads_slips(live_spreads)
 
-                print("  Next scan in", SCAN_INTERVAL_SEC, "seconds...")
-            else:
-                logger.info(f"[Cycle {cycle}] No arbs this round. Next scan in {SCAN_INTERVAL_SEC}s.")
+            has_pregame = pregame_h2h or pregame_totals or pregame_spreads
+            if has_pregame:
+                print("  ==========  PREGAME  ==========\n")
+                if pregame_h2h:
+                    print("  --- MONEYLINE (H2H) ---\n")
+                    ArbitrageScanner.print_bet_slips(pregame_h2h)
+                if pregame_totals:
+                    print("  --- OVER/UNDER (TOTALS) ---\n")
+                    ArbitrageScanner.print_totals_slips(pregame_totals)
+                if pregame_spreads:
+                    print("  --- SPREADS ---\n")
+                    ArbitrageScanner.print_spreads_slips(pregame_spreads)
 
-            time.sleep(SCAN_INTERVAL_SEC)
+            print("  Scan complete.")
+        else:
+            logger.info("No arbs this scan.")
 
     except KeyboardInterrupt:
         logger.info("Stopped by user.")
