@@ -991,7 +991,6 @@ class ArbitrageScanner:
             print(format_spreads_bet_slip(opp, number=i, live=is_live(opp.commence_time)))
             print()
 
-
 # --- MAIN ---
 
 def main() -> None:
@@ -1038,28 +1037,28 @@ def main() -> None:
 
         h2h_opps, totals_opps, spreads_opps = scanner.scan_multiple_sports()
 
-        # Check again after scan (we just used more credits); exit if at limit
         usage = scanner.odds_client.get_usage()
         if usage and usage.get("used") is not None and usage.get("used") >= ODDS_API_CREDITS_LIMIT:
             used = usage.get("used")
             logger.warning(f"Odds API credits at limit after scan ({used} >= {ODDS_API_CREDITS_LIMIT}). Exiting.")
             print(f"  Odds API: {used} credits used (limit {ODDS_API_CREDITS_LIMIT}). Exiting.")
             sys.exit(0)
+
         sorted_h2h = sorted(h2h_opps, key=lambda x: x.profit_pct, reverse=True)
         sorted_totals = sorted(totals_opps, key=lambda x: x.profit_pct, reverse=True)
         sorted_spreads = sorted(spreads_opps, key=lambda x: x.profit_pct, reverse=True)
         has_any = sorted_h2h or sorted_totals or sorted_spreads
 
         if has_any:
+            logger.info(f"Found {len(sorted_h2h)} moneyline + {len(sorted_totals)} totals + {len(sorted_spreads)} spreads")
+            print("\n  *** WORTHWHILE ARBS FOUND — PLACE THESE BETS ***\n")
+
             live_h2h = [o for o in sorted_h2h if is_live(o.commence_time)]
             pregame_h2h = [o for o in sorted_h2h if not is_live(o.commence_time)]
             live_totals = [o for o in sorted_totals if is_live(o.commence_time)]
             pregame_totals = [o for o in sorted_totals if not is_live(o.commence_time)]
             live_spreads = [o for o in sorted_spreads if is_live(o.commence_time)]
             pregame_spreads = [o for o in sorted_spreads if not is_live(o.commence_time)]
-
-            logger.info(f"Found {len(sorted_h2h)} moneyline + {len(sorted_totals)} totals + {len(sorted_spreads)} spreads")
-            print("\n  *** WORTHWHILE ARBS FOUND — PLACE THESE BETS ***\n")
 
             has_live = live_h2h or live_totals or live_spreads
             if has_live:
